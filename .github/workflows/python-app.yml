@@ -1,0 +1,130 @@
+name: Python App CI/CD
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE_NAME: senai_fastapi
+  CONTAINER_NAME: senai_fastapi
+  APP_PORT: 8080
+
+jobs:
+  Build:
+    name: Compilar Projeto
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalar dependências
+        run: |
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest httpx
+
+      - name: Executar testes com pytest
+        run: |
+          PYTHONPATH=. pytest tests/ -v --tb=short
+
+  Imagem:
+    name: Construindo Imagem para Docker
+    runs-on: ubuntu-latest
+    needs: Build
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Login no Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build e Push Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  Deploy_Homologacao:
+    name: Deploy Homologação
+    runs-on: ubuntu-latest
+    needs: Imagem
+    if: github.ref == 'refs/heads/develop'
+    environment: homologacao
+    steps:
+      - name: Deploy via SSH na EC2 de Homologação
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          CONTAINER: ${{ env.CONTAINER_NAME }}-homol
+          PORT: ${{ env.APP_PORT }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE,DH_USER,DH_TOKEN,CONTAINER,PORT
+          script: |
+            echo "$DH_TOKEN" | sudo docker login -u "$DH_USER" --password-stdin
+            sudo docker pull "docker.io/$IMAGE"
+            sudo docker stop "$CONTAINER" 2>/dev/null || true
+            sudo docker rm "$CONTAINER" 2>/dev/null || true
+            sudo docker run -d \
+              --name "$CONTAINER" \
+              --restart unless-stopped \
+              -p 8080:"$PORT" \
+              "$IMAGE"
+            sleep 5
+            curl -f http://localhost:8080/health || exit 1
+            echo "Deploy em HOMOLOGACAO concluido com sucesso!"
+            sudo docker image prune -f
+
+  Deploy_Producao:
+    name: Deploy Produção
+    runs-on: ubuntu-latest
+    needs: Imagem
+    if: github.ref == 'refs/heads/main'
+    environment: producao
+    steps:
+      - name: Deploy via SSH na EC2 de Produção
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          CONTAINER: ${{ env.CONTAINER_NAME }}-prd
+          PORT: ${{ env.APP_PORT }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE,DH_USER,DH_TOKEN,CONTAINER,PORT
+          script: |
+            echo "$DH_TOKEN" | sudo docker login -u "$DH_USER" --password-stdin
+            sudo docker pull "docker.io/$IMAGE"
+            sudo docker stop "$CONTAINER" 2>/dev/null || true
+            sudo docker rm "$CONTAINER" 2>/dev/null || true
+            sudo docker run -d \
+              --name "$CONTAINER" \
+              --restart unless-stopped \
+              -p 8080:"$PORT" \
+              "$IMAGE"
+            sleep 5
+            curl -f http://localhost:8080/health || exit 1
+            echo "Deploy em PRODUCAO concluido com sucesso!"
+            sudo docker image prune -f
